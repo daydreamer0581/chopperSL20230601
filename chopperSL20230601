@@ -1,0 +1,952 @@
+
+string diveSound = "gears"; //             llTriggerSound(diveSound,0.5);
+
+// first number +front -back of plance, last number +up and -down
+//vector gSitTarget = <3.5, 0.0, 2.8>;
+rotation gSitRot = ZERO_ROTATION;
+string gSitText = "Board"; // Text to show in the pie menu for sitting
+
+string gLoopSound = "engines"; // the sound to loop during flying. //llLoopSound(gLoopSound, 1.0);
+key gPilot = NULL_KEY; // who's flying? (distinct from passengers)
+key owner;
+key crew; // primary crew
+integer ticker; // If > 0 , timer ticks since last crossing border, Counts until Pilot has made simcrossing.
+integer threshold; // How long to wait until next notify Pilot 
+
+// these are values for the vehicle motors
+// they'd more properly be state-scope variable for state flying.
+// https://jira.secondlife.com/browse/SVC-3297
+vector linear;
+vector angular;
+float turn; //indicates direction of turn
+vector gLastGoodPos = <0,0,0>; // Last known good position before we hit any Banlines
+vector old_linear;
+vector old_angular; //Stash for these values when ejected, so we can put them back.
+integer old_gear;
+integer old_vgear;
+
+
+// following controls forward/back speed
+float inc_x = 1.0; // changed this to 1 was 2
+// following controls left/right speed
+float inc_y = 1.0; // changed this to 1 was 2
+// following controls up/down speed
+float inc_z = 1.0; // changed this to 1 was 2
+
+// following controls how far below the water surface
+float water_offset = -0.2; // chenged was 1.0
+// following controls how far above the ground it can be
+float ground_offset = 1.0;
+
+float speed = 1.0; // changed this to 1 was 2
+
+integer gRudderPrim = 0;
+integer gListener;
+integer gChannel=1981;
+integer gHUDPrim = 0; // HUDtext
+integer gHUD = 0; // HUDtext, 0 = off, 1 = on Snappy, 2= on HUD
+integer gCrHUD = 0; // HUDtext of the Crew, 0 = off 1 on HUD
+integer gDebug=0;
+integer gear = 0; // Gear Number for Forward Speed
+integer vgear=0;// Ditto, only vertical
+integer curcam = 0;
+integer lcam = 0;
+integer camcount=6;
+integer ejectedat=0;
+integer starttime;
+
+list gStopRotors;
+list gStartRotors;
+list rots; // list of texture rotors
+
+float SENSOR_RANGE = 96.0; // number of metres in which to look for owner, max 96.
+
+list rotTextures=
+    [
+    "5cfd9051-f2e9-ae59-920f-1f1d02f10a7f", // 0: Any Rotor, motion-blurred
+    "ffe30870-8309-dab4-d0d5-01724c6f790b", // 1: Top rotor, standing still
+    "0d0c9e9a-e6a4-e4bf-6cec-27597560ee56", // 2: Top rotoe, standing still, mirrored
+    "d097a37f-e64d-5212-9387-9ce224040983"  // 3: Back rotor, standing still
+    ];
+
+DebugSay(integer prio, string msg)
+{
+    msg="DBG at: "+(string)(starttime-llGetUnixTime())+" - "+msg;
+    if(llKey2Name(owner))
+    {  // Owner is in sim or at least region still has handle
+        if((gDebug >1)||(prio==1))
+            llOwnerSay(msg);
+        else if(gDebug)
+             llSay(DEBUG_CHANNEL,msg);
+    }
+    else
+    {
+        llInstantMessage(owner,msg);
+    }
+}
+
+string FormatDecimal(float number, integer precision) // HUDtext whole thing below
+{    
+    float roundingValue = llPow(10, -precision)*0.5;
+    float rounded;
+    if (number < 0) rounded = number - roundingValue;
+    else            rounded = number + roundingValue;
+ 
+    if (precision < 1) // Rounding integer value
+    {
+        integer intRounding = (integer)llPow(10, -precision);
+        rounded = (integer)rounded/intRounding*intRounding;
+        precision = -1; // Don't truncate integer value
+    }
+ 
+    string strNumber = (string)rounded; // HUDtext
+    return llGetSubString(strNumber, 0, llSubStringIndex(strNumber, ".") + precision); // HUDtext
+}
+
+string wwGetSLUrl()
+{ // from http://wiki.secondlife.com/wiki/LlGetRegionName
+    string globe = "http://maps.secondlife.com/secondlife";
+    string region = llGetRegionName();
+    vector pos = llGetPos();
+    string posx = (string)llRound(pos.x);
+    string posy = (string)llRound(pos.y);
+    string posz = (string)llRound(pos.z);
+    return (globe + "/" + llEscapeURL(region) +"/" + posx + "/" + posy + "/" + posz);
+}
+
+findBits()
+{
+    integer i=llGetObjectPrimCount(llGetKey()); // Should get number of Non-AvatarmPrims in our Object
+    if(i==0) // Happens if vehicle was (accidentally) attached, just assume no Avs sitting :-).
+        i=llGetNumberOfPrims();
+    /*if(llGetInventoryType(gLoopSound)==INVENTORY_SOUND) //added to see what happens
+        llLoopSound(gLoopSound, 1.0);  // added to see what happens works yay! ^^*/
+    integer j=0;
+    string lname; // ident text
+    string lcmd;
+    vector axis;
+    gStartRotors=gStopRotors=[];
+    for(;i>=j;j++)
+    {
+        // run through all prims
+        lname=llGetLinkName(j);
+        lcmd=llGetSubString(lname,0,3);
+        axis=ZERO_VECTOR;
+        if(lcmd=="thud") // HUDtext
+            gHUDPrim=j; // HUDtext
+        else if(lcmd=="trot")
+        {
+            string dir=llGetSubString(lname,4,4);
+            integer texid=(integer)llGetSubString(lname,5,-1);
+            if(dir=="-")
+                rots+=[-j];
+            else
+                rots+=[j];
+            //llOwnerSay("TRot Prim: "+(string)j+" Dir: "+dir+" Textid: "+(string)texid+" .");
+            gStartRotors=gStartRotors+[PRIM_LINK_TARGET,j,
+                                       PRIM_TEXTURE,ALL_SIDES,llList2String(rotTextures,0),<1,1,1>,<0,0,0>,0.0];
+            gStopRotors=gStopRotors+[PRIM_LINK_TARGET,j,
+                                       PRIM_TEXTURE,ALL_SIDES,llList2String(rotTextures,texid+1),<1,1,1>,<0,0,0>,0.0];
+        }
+    }
+}
+
+
+list Cameras=
+    [
+    // CSVs; Distance, Pitch, Offset, Lag, Name
+    "12.0,8.0,<0,0,0>,0.1,Std",  // Standard Flying Camera, close to no lag
+    "12.0,8.0,<0,0,0>,0.5,Loose",  // Ditto, More Loose
+    "15.0,90.0,<-5,0,0>,0.2,Landing", // Downpointing landing cam // changing
+    "10.0,45.0,<-5,0,-5>,0.2,Land2", // Angled down landing cam
+    "3.0,0.0,<0,1.7,-1>,0.1,Left",  // Right over wing
+    "3.0,0.0,<0,-1.7,-1>,0.1,Right"   // Left over wing
+    ];
+
+
+setCamera(integer camno)
+{
+    string campos=llList2String(Cameras,camno%camcount);
+    list camvals=llCSV2List(campos);
+    float dist=(float)llList2String(camvals,0);
+    float pitch=(float)llList2String(camvals,1);
+    vector offset=(vector)llList2String(camvals,2);
+    float lag=(float)llList2String(camvals,3);
+    string name=llList2String(camvals,4);
+    if(lcam!=camno)
+        {
+        llOwnerSay("Camera: "+name);
+        lcam=camno;
+        }
+    llSetCameraParams([
+        CAMERA_ACTIVE, TRUE,
+        CAMERA_BEHINDNESS_ANGLE, 0.0,
+        CAMERA_BEHINDNESS_LAG, lag,
+        CAMERA_DISTANCE, dist,
+        CAMERA_PITCH, pitch,
+        CAMERA_FOCUS_LAG, lag,
+        CAMERA_FOCUS_LOCKED, FALSE,
+        CAMERA_FOCUS_THRESHOLD, 0.0,
+        CAMERA_FOCUS_OFFSET, offset,
+        CAMERA_POSITION_LAG, lag,
+        CAMERA_POSITION_LOCKED, FALSE,
+        CAMERA_POSITION_THRESHOLD, 0.0        
+    ]);
+}
+// for the smaller rotors at rest ==== d097a37f-e64d-5212-9387-9ce224040983
+setRotors(integer fly_state)
+    {
+    integer´prim; // The number of the prim we are working on in the while loops
+    integer i=llGetListLength(rots); // Loop Counter
+    if(fly_state==1)
+        {
+        //llOwnerSay("Turning on rotors");
+        llSetLinkPrimitiveParamsFast(1,gStartRotors);
+        while(i>0)
+            {
+            prim=llList2Integer(rots,--i);
+            if(prim>0) // turn clockwise
+                llSetLinkTextureAnim(prim,ANIM_ON | ROTATE | SMOOTH | LOOP, ALL_SIDES, 1, 1, 0, PI, 20);
+            else // turn counterclockwise denoted by negative prim number
+                llSetLinkTextureAnim(-prim,ANIM_ON | ROTATE | SMOOTH | LOOP, ALL_SIDES, 1, 1, 0, PI, -20);
+            }
+        llLoopSound(gLoopSound, 2.0); //added ..kinda maybe??      
+        }
+    else
+        {
+        //llOwnerSay("Turning off rotors");
+        llSetLinkPrimitiveParamsFast(1,gStopRotors);
+        while(i>0)
+            {
+            prim=llList2Integer(rots,--i);
+            if(prim>0)
+                llSetLinkTextureAnim(prim,ANIM_ON | ROTATE | SMOOTH | LOOP, ALL_SIDES, 1, 1, 0, PI, 0);
+            else
+                llSetLinkTextureAnim(-prim,ANIM_ON | ROTATE | SMOOTH | LOOP, ALL_SIDES, 1, 1, 0, PI, 0);
+            }
+        llStopSound(); // think this working
+        }
+    }
+
+setVehicle()
+{
+    llCollisionSound("", 0.5);
+    llSetVehicleType(VEHICLE_TYPE_AIRPLANE);
+    // linear friction
+    llSetVehicleVectorParam(VEHICLE_LINEAR_FRICTION_TIMESCALE, <100.0, 100.0, 100.0>);
+    // uniform angular friction
+    llSetVehicleFloatParam(VEHICLE_ANGULAR_FRICTION_TIMESCALE, 0.5);
+    // linear motor
+    llSetVehicleVectorParam(VEHICLE_LINEAR_MOTOR_DIRECTION, <0.0, 0.0, 0.0>);
+    llSetVehicleFloatParam(VEHICLE_LINEAR_MOTOR_TIMESCALE, 0.5);
+    llSetVehicleFloatParam(VEHICLE_LINEAR_MOTOR_DECAY_TIMESCALE, 0.9);
+    // angular motor, got some dictates banking here
+    llSetVehicleVectorParam(VEHICLE_ANGULAR_MOTOR_DIRECTION, <0.0, 0.0, 0.0>);
+    llSetVehicleFloatParam(VEHICLE_ANGULAR_MOTOR_TIMESCALE, 0.5); //changing this 1.0 is slow banking and 0.3 is fast banking
+    llSetVehicleFloatParam(VEHICLE_ANGULAR_MOTOR_DECAY_TIMESCALE, 0.5);
+    // hover
+    llSetVehicleFloatParam(VEHICLE_HOVER_HEIGHT, 0.0);
+    llSetVehicleFloatParam(VEHICLE_HOVER_EFFICIENCY, 0.0);
+    llSetVehicleFloatParam(VEHICLE_HOVER_TIMESCALE, 350.0);
+    llSetVehicleFloatParam(VEHICLE_BUOYANCY,1.0);
+    // linear deflection
+    llSetVehicleFloatParam(VEHICLE_LINEAR_DEFLECTION_EFFICIENCY, 0.5);
+    llSetVehicleFloatParam(VEHICLE_LINEAR_DEFLECTION_TIMESCALE, 1.0);
+    // angular deflection
+    llSetVehicleFloatParam(VEHICLE_ANGULAR_DEFLECTION_EFFICIENCY, 0.25);
+    llSetVehicleFloatParam(VEHICLE_ANGULAR_DEFLECTION_TIMESCALE, 100.0);
+    // vertical attractor
+    llSetVehicleFloatParam(VEHICLE_VERTICAL_ATTRACTION_EFFICIENCY, 0.75);
+    llSetVehicleFloatParam(VEHICLE_VERTICAL_ATTRACTION_TIMESCALE, 1.0);
+    // banking
+    llSetVehicleFloatParam(VEHICLE_BANKING_EFFICIENCY, 1.0);
+    llSetVehicleFloatParam(VEHICLE_BANKING_MIX, 1.0);
+    llSetVehicleFloatParam(VEHICLE_BANKING_TIMESCALE, 360.0);
+    // default rotation of local frame
+    llSetVehicleRotationParam(VEHICLE_REFERENCE_FRAME, <0.0, 0.0, 0.0, 1.0>);
+    // removed vehicle flags
+    llRemoveVehicleFlags(VEHICLE_FLAG_NO_DEFLECTION_UP 
+                        | VEHICLE_FLAG_HOVER_WATER_ONLY 
+                        | VEHICLE_FLAG_HOVER_TERRAIN_ONLY 
+                        | VEHICLE_FLAG_HOVER_UP_ONLY 
+                        | VEHICLE_FLAG_LIMIT_MOTOR_UP 
+                        | VEHICLE_FLAG_LIMIT_ROLL_ONLY);
+    // set vehicle flags
+    llSetVehicleFlags(VEHICLE_FLAG_HOVER_GLOBAL_HEIGHT);
+}
+
+default
+{
+state_entry()
+    {
+        // some basic initializations
+        gPilot = NULL_KEY;
+        llStopSound(); //added sound engine
+        gHUDPrim=0;
+        lcam=curcam=gHUD=0;
+        rots=[];
+        findBits();
+        owner=llGetOwner(); // get it *once* only
+        ejectedat=0;
+        starttime=llGetUnixTime();
+        state atRest;
+    }
+
+on_rez(integer _dummy)
+    { // complete overkill, but does no harm
+        llResetScript();
+    }
+
+changed(integer change)
+    {
+    if (change & (CHANGED_OWNER))
+        llResetScript();
+    }
+}
+
+state atRest
+{
+    // state atRest is the state we should be in when the vehicle is at rest
+    // just sitting there, as in we just rezzed it, or the avatar stood up from it.
+    // mainly this state is responsible for starting the flying sequence when
+    // the owner sits on the vehicle.
+state_entry()
+    {
+        // nobody flying the thing...
+        DebugSay(0,"State atRest Started ---------------------------------!");
+        gPilot = NULL_KEY;
+        // turn off vehicle stuff.
+        llSetStatus(STATUS_PHYSICS, FALSE);
+        // TODO: make the vehicle right itself.
+        // let the whole object know we're at rest.
+        llMessageLinked(LINK_SET, 0, "flying", NULL_KEY);
+        //llMessageLinked(LINK_SET, 0, "rotate", NULL_KEY);
+        setRotors(0);
+        gListener=llListen(gChannel,"",NULL_KEY,""); // changed to make hud work
+
+        key agent = llAvatarOnSitTarget();
+        // same as the owner?
+        if (agent == owner)
+        {
+            // store pilot key...
+            gPilot = agent;
+            ejectedat=0; //definitely not ejected anymore
+            // ask politely for permission do to stuff.
+            // These will be automatically granted.
+            llRequestPermissions(agent,
+                //PERMISSION_TRIGGER_ANIMATION | 
+                PERMISSION_TAKE_CONTROLS | 
+                PERMISSION_CONTROL_CAMERA);
+            llSetTimerEvent(0);
+        }
+        else if(ejectedat > 0)
+        {
+        // lost our pilot due to their being ejected by SL Simcrossing bug. Send them messages where we are every minute
+            DebugSay(0,"Was ejected, sensoring!");
+            llSetTimerEvent(60);
+        }
+        else
+            llSetTimerEvent(0);
+    }
+    
+changed(integer what)
+    {
+        // Whenever an av sits on or stands up from an object, it is treated as if it
+        // were being linked or unlinked.
+        // Unfortunately, there are a whole bunch of other things that cause CHANGED_LINK
+        // as well, so we have to allow for them.
+        // Things that can cause CHANGED_LINK: 1) linking in new prims, 2) unlinking prims
+        // 3) avatars sitting, 4) avatars unsitting
+        if (what & CHANGED_LINK)
+        {
+            // are there *any* seated avatars?
+            if (llGetNumberOfPrims() != llGetObjectPrimCount(llGetKey()))
+            {
+                // we have seated avs, so let's find the sit target one
+                key agent = llAvatarOnSitTarget();
+                // same as the owner?
+                if (agent == owner)
+                {
+                    // store pilot key...
+                    gPilot = agent;
+                    DebugSay(0,"Owner Sat");
+                    // ask politely for permission do to stuff.
+                    // These will be automatically granted.
+                    llRequestPermissions(agent,
+                        //PERMISSION_TRIGGER_ANIMATION | 
+                        PERMISSION_TAKE_CONTROLS | 
+                        PERMISSION_CONTROL_CAMERA);
+                }
+                else
+                // sit target agent is not the owner
+                {
+                    llUnSit(agent);
+                   // llWhisper(0,"Only the owner can drive this vehicle.");
+                }
+            }
+            else
+            // there are no seated avatars...
+            {
+                if (gPilot != NULL_KEY)
+                {
+                    // since there are no seated avs, but we still know about 
+                    // the pilot, they must have just stood up.
+                    // we need to release controls and do other cleanup
+                    llReleaseControls();
+                    llClearCameraParams();
+                    gPilot = NULL_KEY;
+                }
+            }
+        }
+//        if (what & CHANGED_INVENTORY)
+//        {
+//            // someone might have dropped in a new animation
+//            newAnimationCheck();
+//        }
+        if (what & CHANGED_REGION)
+        { // Weird, how did this happen while at rest ?
+            setRotors(0);
+        }
+        if (what & (CHANGED_OWNER))
+            llResetScript();
+    }
+
+listen(integer chan, string what, key who, string msg)
+    {
+    if(llGetOwnerKey(who) == owner) // ((ch==0) &&  (av==llGetOwner()))
+        {
+        if(msg=="on")
+            setRotors(1);
+        else if(msg=="off")
+            setRotors(0);
+        else if(msg=="debug") // turn debugging messages on or off
+            {
+            gDebug=1;
+            DebugSay(1,"Turning debugging High");
+            }
+        else if(msg=="debughi") // Extra debugging messages
+            {
+            gDebug=2;
+            DebugSay(1,"Turning debugging High");
+            }
+        else if(msg=="debugoff")
+            {
+            gDebug=0;
+            DebugSay(1,"Turning debugging off");
+            }
+        else if(msg=="physics")
+            {
+            llSetStatus(STATUS_PHYSICS, TRUE);
+            DebugSay(1,"Forcing Physics on.");
+            }
+        else if(msg=="physicsoff")
+            {
+            llSetStatus(STATUS_PHYSICS, FALSE);
+            DebugSay(1,"Forcing Physics off.");
+            }
+        else if(msg=="state")
+            {
+            DebugSay(1,"State is atRest. Gear: "+(string)gear+" VGear: "+(string)vgear+" Linear: "+(string)linear+" Angular: "+(string)angular);
+            DebugSay(1,"Ejected: "+(string)ejectedat+" Ticker: "+(string)ticker+" Threshold: "+(string)threshold);
+            }
+        else if(msg=="controls")
+            {
+            DebugSay(1,"Can't do that in atRest State.");
+            }
+        else if(msg=="reinit")
+            {
+            DebugSay(1,"Probably useless in atRest State. But will try anyhow.");
+            state atRest;
+            }
+        else if(msg=="reset")
+            {
+            llResetScript();
+            }
+        else if((msg=="rear guns on")||(msg=="rear guns off")||
+                (msg=="cannons on")||(msg=="rockets on")||(msg=="rockets off")||
+                (msg=="cannons off")||
+                (msg=="machine guns on")||(msg=="machine guns off"))
+            {
+            // Silently ignore
+            }
+        else if((msg=="cam")||(msg=="on")||(msg=="off")||(msg=="texthud"))
+            {
+            llOwnerSay("You need to be sitting to do that!");
+            }
+        else
+            DebugSay(1,"Unknown command: '"+msg+"'.");
+        }
+    }
+
+run_time_permissions(integer perm)
+    {
+        // to be correct, we really should check the perms and make sure we
+        // got the ones we need. but this will usually work:
+        DebugSay(0,"Perms gotten: "+(string)perm);
+        if (perm) state flying;
+    }
+    
+    //on_rez(integer foo) { state default; }
+on_rez(integer _dummy)
+    { // complete overkill, but does no harm
+        llResetScript();
+    }
+
+sensor(integer num)
+    {
+    DebugSay(0,"Found you again! No more messages.");
+    llSetTimerEvent(0);
+    }
+
+no_sensor()
+    {
+    llInstantMessage(owner,"You seem to have got ejected! I am waiting over here!: "+wwGetSLUrl());
+    }
+
+timer()
+    {
+    if(++ticker<10)
+        {
+        //recheck every minute for 10 minutes.
+        llSensor("",owner,AGENT,SENSOR_RANGE,PI);
+        //llInstantMessage(owner,"You seem to have got ejected! I am waiting over here!: "+wwGetSLUrl());
+        }
+    else
+        {
+        llInstantMessage(owner,"You seem to have got ejected! I'll be waiting over here: "+wwGetSLUrl());
+        llSetTimerEvent(0); // Stop sending
+        }
+    }
+}
+
+state flying
+{
+    // state flying assumes we have permission to take controls, run animations,
+    // and control the camera.
+state_entry()
+    {
+        DebugSay(0,"State flying Started");
+        llSetTimerEvent(0.05);
+        llTakeControls( CONTROL_FWD |
+            CONTROL_BACK |
+            CONTROL_LEFT |
+            CONTROL_RIGHT |
+            CONTROL_ROT_LEFT |
+            CONTROL_ROT_RIGHT |
+            CONTROL_UP |
+            CONTROL_DOWN |
+            CONTROL_LBUTTON,
+            TRUE, FALSE);
+        turn=0.0;
+        setVehicle();
+        setCamera(curcam);
+        vector current_pos = llGetPos(); // get our current position for next command
+        llSetVehicleFloatParam(VEHICLE_HOVER_HEIGHT, current_pos.z); // set Vehicle Hover Height to our current height.
+        llSetStatus(STATUS_PHYSICS, TRUE);
+        //let the rest of the object know we're flying
+        //llMessageLinked(LINK_SET, 1, "rotate", NULL_KEY);
+        llMessageLinked(LINK_SET, 0, "flying", NULL_KEY);
+        gListener=llListen(gChannel,"",NULL_KEY,"");
+        setRotors(1);
+        crew=NULL_KEY;
+        if(gHUD==0) // Is the HUD off ? if yes, clear the Snappy Text HUD. If not off, timer() will set it 
+            llSetLinkPrimitiveParamsFast(gHUDPrim,[PRIM_TEXT,"",<1,1,1>,1]); // turn off the Snappy HUDtext
+        if((ejectedat!=0) && (ejectedat-llGetUnixTime())<300) // we got ejected less than 5 mins ago ?
+        { // then Restore previous values
+            DebugSay(1,"Restarting Motion.");
+            gear=old_gear;
+            vgear=old_vgear;
+            linear=old_linear;
+            angular=old_angular;
+        }
+    }
+
+changed(integer what)
+    {
+        // Whenever an av sits on or stands up from an object, it is treated as if it
+        // were being linked or unlinked.
+        // Unfortunately, there are a whole bunch of other things that cause CHANGED_LINK
+        // as well, so we have to allow for them.
+        // Things that can cause CHANGED_LINK: 1) linking in new prims, 2) unlinking prims
+        // 3) avatars sitting, 4) avatars unsitting
+        if (what & CHANGED_LINK)
+        {
+            // are there *any* seated avatars?
+            
+            if (llGetNumberOfPrims() == llGetObjectPrimCount(llGetKey()))
+            {
+                // there are no seated avatars...
+                DebugSay(0,"LinkCount to ("+(string)llGetNumberOfPrims()+","+(string)llGetObjectPrimCount(llGetKey())+").");
+                    // if ticker is not 0 in following, that means we just crossed a sim border and pilot is likely missing
+                    // *temporarily*. ignore it and keep going, ticker logic will notice if it takes too long to get pilot back.
+                if ((gPilot != NULL_KEY) && (ticker ==0))
+                {
+                    // since there are no seated avs, but we still know about 
+                    // the pilot, they must have just stood up, so let's rest.
+                    DebugSay(0,"No seated avs");
+                    state atRest;
+                }
+            }
+        }
+        if (what & CHANGED_REGION)
+        { // Changing region often zeroes Link Omegas, set them again just in case.
+            //llSleep(0.3);
+            setRotors(1);
+            ticker=1; //Start ticker for the timer() routine to check if Pilot is with us again
+            threshold=20; // wait 1 sec for first notify
+            //state flying; //added far more stable, but still turn bug there
+                            // removed by Mau for creating more Issues than it fixed
+            DebugSay(0,"Sim Border Cross to "+llGetRegionName());
+        }
+        if (what & (CHANGED_OWNER))
+            llResetScript();
+    }
+
+    // The control event is what we get when the user mashed down the keys
+    // we asked about in llTakeControls().
+control(key id, integer levels, integer edges)
+    {
+        integer start = levels & edges;
+        integer end = ~levels & edges;
+        integer held = levels & ~edges; 
+        integer untouched = ~(levels | edges);
+            
+             
+//start,end,held and untouched and self explanitory, and make control events more readable
+            
+        if(llGetStatus(STATUS_PHYSICS)!=TRUE)
+            DebugSay(0,"Physics are OFF!");
+        //    llSetStatus(STATUS_PHYSICS, TRUE);
+        if((vgear!=0) && (levels & CONTROL_UP) && (levels & CONTROL_DOWN))
+            {
+            // User hit up *and* down -> stop vertical movement
+            vgear=0;
+            linear.z=0.0;
+            }
+        if((gear!=0) && (levels & CONTROL_FWD) && (levels & CONTROL_BACK))
+            {
+            // User hit Fwd *and* Back -> stop forward movement
+            gear=0;
+            linear.x=0.0;
+            }
+        if ((start & CONTROL_UP)) {
+            if(vgear<20)
+                {
+                vgear++;
+                linear.z = vgear*speed; // changed this linear.z -= inc_z to this linear.z += speed;
+                llTriggerSound(diveSound,0.5);
+                }
+            //this is saying, "if up key is pressed, even if held, the sound will play only on the initial press of the key"
+            llTriggerSound(diveSound,0.5); //original 1.0
+            llMessageLinked(LINK_SET, 0, "pageup", NULL_KEY);
+        } //else if ((end & CONTROL_UP)) { // going to edit this out to see what happens
+          //  linear.z -= speed; // going to edit this out to see what happens // changed this linear.z -= inc_z to this linear.z += speed;
+          // }
+                
+        if ((start & CONTROL_DOWN)) {
+            if(vgear>-20)
+                {
+                vgear--;
+                linear.z = vgear*speed; // changed this linear.z -= inc_z to this linear.z += speed;
+                }
+            llTriggerSound(diveSound,0.5); //original 1.0
+            llMessageLinked(LINK_SET, 0, "pagedown", NULL_KEY);
+        }   // else if ((end & CONTROL_DOWN)) { // going to edit this out to see what happens
+            // linear.z += speed;} // going to edit this out to see what happens
+        if ((start & CONTROL_FWD)) 
+        {
+            llTriggerSound(diveSound,0.5); //original 1.0
+//            setRotors(1);
+            if(gear<120) // speedlimiting to roughly 60 knots
+                {
+                gear++;
+                linear.x = gear*speed;
+                }
+        } 
+
+        if ((start & CONTROL_BACK)) 
+        {
+            llTriggerSound(diveSound,0.5); //original 1.0
+//            setRotors(1);
+            if(gear>-20) // speedlimiting
+                {
+                gear--;
+                linear.x = gear*speed;
+                }
+            //linear.x -= speed; shrugs dont know
+        }
+
+        if ((start & (CONTROL_LEFT | CONTROL_ROT_LEFT))) {
+            llSleep(0.05);
+            angular.z = (PI / 180) * 15.0;
+            turn=1.0;
+            angular.x -= PI * 4;
+            llResetTime();
+        } else if ((end & (CONTROL_LEFT | CONTROL_ROT_LEFT))) {
+            llSleep(0.05);
+            //angular.z -= (PI / 180) * 55.0; not sure what this is
+            angular.z = 0.0;
+            turn=0.0;
+            angular.x += PI * 4;
+            if(llGetAgentSize(gPilot)!=ZERO_VECTOR)
+                setCamera(curcam);
+//            setRotors(1);
+        }
+
+        if ((start & (CONTROL_RIGHT | CONTROL_ROT_RIGHT))) {
+            llSleep(0.05);
+            angular.z = (PI / 180) * -15.0;
+            turn=-1.0;
+            angular.x += PI * 4;
+            llResetTime();
+        } else if ((end & (CONTROL_RIGHT | CONTROL_ROT_RIGHT))) {
+            llSleep(0.05);
+            //angular.z += (PI / 180) * 55.0; not sure what this is
+            turn=0.0;
+            angular.z = 0.0;
+            angular.x -= PI * 4;
+            if(llGetAgentSize(gPilot)!=ZERO_VECTOR)
+                setCamera(curcam);
+//            setRotors(1);
+        }        
+    }
+
+run_time_permissions(integer perm)
+    {
+    // was requested by pilot, so try reinstating Camera and Controls
+    DebugSay(0,"Perm: "+(string)perm);
+    if(perm && PERMISSION_CONTROL_CAMERA)
+        setCamera(curcam);
+    if(perm && PERMISSION_TAKE_CONTROLS)
+        {
+        llTakeControls( CONTROL_FWD |
+            CONTROL_BACK |
+            CONTROL_LEFT |
+            CONTROL_RIGHT |
+            CONTROL_ROT_LEFT |
+            CONTROL_ROT_RIGHT |
+            CONTROL_UP |
+            CONTROL_DOWN |
+            CONTROL_LBUTTON,
+            TRUE, FALSE);
+        llOwnerSay("Controls reset!");
+        }
+    }
+
+listen(integer chan, string what, key who, string msg)//listen(integer ch,string name, key av, string msg)
+    {
+    if(llGetOwnerKey(who) == owner) // ((ch==0) &&  (av==llGetOwner()))
+        {
+        if(msg=="on")
+            setRotors(1);
+        else if(msg=="off")
+            setRotors(0);
+        else if(msg=="texthud") // Activate/Deactivate Text HUD
+            {
+            gHUD=(++gHUD)%2; // HUDtext, formula will switch between 0 and 1
+            if(gHUD==0) // HUDtext
+                {
+                llSetLinkPrimitiveParamsFast(gHUDPrim,[PRIM_TEXT,"",<1,1,1>,1]); // turn off HUDtext
+                }
+            /*else
+                {
+                llSay(gChannel+10," "); // Turn off HUDText on the HUD
+                }*/
+            }
+        else if(msg=="cam") // Change camera settings
+            {
+            if(llGetAgentSize(gPilot)!=ZERO_VECTOR)
+                setCamera(++curcam);
+            }
+        else if(msg=="debug")
+            {
+            gDebug=1;
+            DebugSay(1,"Turning debugging On");
+            }
+        else if(msg=="debughi")
+            {
+            gDebug=2;
+            DebugSay(1,"Turning debugging High");
+            }
+        else if(msg=="debugoff")
+            {
+            gDebug=0;
+            DebugSay(1,"Turning debugging off");
+            }
+        else if(msg=="physics")
+            {
+            llSetStatus(STATUS_PHYSICS, TRUE);
+            DebugSay(1,"Forcing Physics on.");
+            }
+        else if(msg=="physicsoff")
+            {
+            llSetStatus(STATUS_PHYSICS, FALSE);
+            DebugSay(1,"Forcing Physics off.");
+            }
+        else if(msg=="state")
+            {
+            DebugSay(1,"State is Flying. Gear: "+(string)gear+" VGear: "+(string)vgear+" Linear: "+(string)linear+" Angular: "+(string)angular);
+            DebugSay(1,"Ejected: "+(string)ejectedat+" Ticker: "+(string)ticker+" Threshold: "+(string)threshold);
+            DebugSay(1,"AVSz: "+(string)llGetAgentSize(gPilot)+" Own: "+llKey2Name(owner)+".");
+            }
+        else if(msg=="controls")
+            {
+            llRequestPermissions(owner,
+                    PERMISSION_TAKE_CONTROLS|
+                    PERMISSION_CONTROL_CAMERA);
+            /*llReleaseControls();
+            llTakeControls( CONTROL_FWD |
+            CONTROL_BACK |
+            CONTROL_LEFT |
+            CONTROL_RIGHT |
+            CONTROL_ROT_LEFT |
+            CONTROL_ROT_RIGHT |
+            CONTROL_UP |
+            CONTROL_DOWN |
+            CONTROL_LBUTTON,
+            TRUE, FALSE);*/
+            }
+        else if(msg=="reinit")
+            {
+            state atRest;
+            }
+        else if(msg=="reset")
+            {
+            llResetScript();
+            }
+        else if((msg=="rear guns on")||(msg=="rear guns off")||
+                (msg=="cannons on")||(msg=="cannons off")||(msg=="rockets on")
+                ||(msg=="rockets off")||
+                (msg=="machine guns on")||(msg=="machine guns off"))
+            {
+            // Silently ignore
+            }
+        else
+            DebugSay(1,"Unknown command: '"+msg+"'.");
+        }
+    else if(llGetOwnerKey(who) == crew)
+        {
+        if(msg=="on")
+            setRotors(1);
+        else if(msg=="off")
+            setRotors(0);
+        else if(msg=="texthud") // Activate/Deactivate Text HUD
+            {
+            gCrHUD=(++gHUD)%2; // HUDtext
+            if(gHUD!=1)
+                {
+                llSay(gChannel+10," "); // Turn off HUDText on the HUD
+                }
+            }
+        }
+    }
+
+timer()
+    {
+        if(ticker)
+            { // seems we haven't found our owner yet.
+            ticker++;
+            if(llGetAgentSize(gPilot)!=ZERO_VECTOR)
+                {
+                //found pilot again. Stop Count for notify/eject
+                DebugSay(0,"Border Cross took "+(string)(0.05*ticker)+" sec. Own: "+llKey2Name(owner)+".");
+                setCamera(curcam);
+                ticker=0;
+                }
+            else if(ticker>200) // ten seconds grace period to allow Pilot to tp to us
+                {
+                // owner not found in the Sensor!  Panic!
+                DebugSay(0,"Ejecting Pilot "+llKey2Name(owner)+".");
+                llInstantMessage(owner,"Hoping you are OK! I am over here!: "+wwGetSLUrl()+" . I will now unseat you so hopefully you can move!");
+                ticker=0;
+                ejectedat=llGetUnixTime();
+                old_linear=linear; // stash these for when/if the pilot gets back on.
+                old_angular=angular;
+                old_gear=gear;
+                old_vgear=vgear;
+                DebugSay(1,"Forcing Unsit to clear controls");
+                llUnSit(owner); // make SL noticeowner was unseated.
+                state atRest;
+                }
+            else if(ticker>threshold)
+                {
+                // Seems we have not seen our pilot since more than threshold ticks. Send them a warning where we are
+                DebugSay(0,"ThresholdTicker.");
+                llInstantMessage(owner,"You seem to have got ejected! I am over here!: "+wwGetSLUrl());
+                threshold+=40; //wait another 2 seconds to resend warning or close.
+                }
+            }
+        // Anti-Banline Code by Animats (See https://marketplace.secondlife.com/p/Beach-Ball-Ban-Line-Tester/14919476)        
+        if (llGetStatus(STATUS_PHYSICS))
+            gLastGoodPos = llGetPos();                              
+        else
+            {
+            DebugSay(1,"We hit a ban line. Moving back from it!");
+            llSetPos(gLastGoodPos);                                 
+            llSleep(0.5);                                           
+            llSetStatus(STATUS_PHYSICS, TRUE);
+            } // End Anti-BanLine Code
+
+        if((turn!=0.0) && (llGetTime()>0.5))
+            {
+            // increase turn speed after short time of kexpress
+            angular.z = (PI / 180) * 55.0*turn;
+            }
+            
+        vector vel = llGetVel();
+        float alt; //Altitude over water/ground
+        vector MahPos = llGetPos();
+        float knvel= llVecMag(vel) /.514444; // in knots
+        float water = llWater(vel * 0.01); // original 0.05 land on water
+        float ground = llGround(vel * 0.01); // original 0.05 land on water
+        string id;
+        if (water > ground)  {  // above water
+             alt=MahPos.z-water;
+             id="o.Sea";
+             if (MahPos.z < water+water_offset){
+                 llSetVehicleFloatParam(VEHICLE_HOVER_EFFICIENCY, 0.1); // land on water original was 0.5
+                 llSetVehicleFloatParam(VEHICLE_HOVER_TIMESCALE, 1.0); // land on water orginal was 0.1
+                 llSetVehicleFloatParam(VEHICLE_HOVER_HEIGHT, water + water_offset);
+             }
+             else {
+                 llSetVehicleFloatParam(VEHICLE_HOVER_EFFICIENCY, 0.0);
+                 llSetVehicleFloatParam(VEHICLE_HOVER_TIMESCALE, 350.0);
+             }
+        }
+        else { // above ground
+             alt=MahPos.z-ground;
+             id="o.Gnd";
+             llSetVehicleFloatParam(VEHICLE_HOVER_EFFICIENCY, 0.0);
+             llSetVehicleFloatParam(VEHICLE_HOVER_TIMESCALE, 350.0);
+        }
+        
+        llSetVehicleVectorParam(VEHICLE_LINEAR_MOTOR_DIRECTION, linear);
+        llSetVehicleVectorParam(VEHICLE_ANGULAR_MOTOR_DIRECTION, angular);
+        if(gHUD==1) // HUDtext
+            llSetLinkPrimitiveParamsFast(gHUDPrim,[PRIM_TEXT,"Spd: "+FormatDecimal(knvel,1)+" kn Gear: "+(string)gear+"\nAlt: "+FormatDecimal(alt,0)+"m "+id+" Vert: "+(string)vgear,<1,1,1>,1]); // HUDtext for the Snappy Text HUD
+        llSay(gChannel+10,"Gear: "+(string)gear+" Vert: "+(string)vgear); // Send Gears to Pilot's HUD for Display
+    }
+
+
+state_exit()
+    {
+        // we need to release controls and do other cleanup
+        DebugSay(0,"Exit Flying.");
+        gear=vgear=0;
+        angular=linear=ZERO_VECTOR;
+        llStopSound();
+        llReleaseControls();
+        if(llGetAgentSize(gPilot)!=ZERO_VECTOR)
+            {
+            llClearCameraParams();
+            }
+        llSetLinkPrimitiveParamsFast(gHUDPrim,[PRIM_TEXT,"",<1,1,1>,1]); // HUDtext hide when not flying
+        llSay(gChannel+10," ");
+    }
+
+    //on_rez(integer foo) { state default; }
+on_rez(integer _dummy)
+    { // complete overkill, but does no harm
+        llResetScript();
+    }
+}
